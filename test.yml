@@ -1,0 +1,292 @@
+
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@5.3.2
+  aws-ecr: circleci/aws-ecr@9.5.1
+
+parameters:
+  properties_repo_url:
+    type: string
+    default: "github.com/Cobre-Colombia/util-properties.git"
+    description: "Host y ruta del repo de properties"
+  properties_branch:
+    type: string
+    default: "trunk"
+    description: "Branch del repositorio de properties"
+  environment:
+    type: enum
+    enum: ["dev","qa","prod"]
+    default: "dev"
+    description: "Perfil de Maven a usar"
+  java_image:
+    type: string
+    default: "cimg/openjdk:21.0"
+    description: "Imagen para ejecutar los flujos de trabajo"
+  java_version:
+    type: string
+    default: "21"
+    description: "Versión de Java (Corretto)"
+  maven_args:
+    type: string
+    default: ""
+    description: "Args adicionales para Maven"
+  is_pr:
+    type: boolean
+    default: false
+    description: "Indica si es un Pull Request"
+  should_deploy:
+    type: boolean
+    default: false
+  deployment_environment:
+    type: enum
+    enum: [ "","dev","qa","prod" ]
+    default: ""
+  deploy_env:
+    type: string
+    default: ""
+  version:
+    type: string
+    default: "0.0.0"
+  version_tag:
+    type: string
+    default: "0.0.0"
+  telemetry_enabled:
+    type: boolean
+    default: false
+
+jobs:
+  build-and-test:
+    docker:
+      - image: << pipeline.parameters.java_image >>
+    steps:
+      - checkout
+
+      - run:
+          name: Clone properties repo
+          command: |
+            rm -rf ../util-properties
+            git clone "https://${GITHUB_COBRE_TOKEN}@<< pipeline.parameters.properties_repo_url >>" ../util-properties
+            git -C ../util-properties checkout "<< pipeline.parameters.properties_branch >>"
+
+      - restore_cache:
+          keys:
+            - m2-{{ checksum "pom.xml" }}
+            - m2-
+
+      - run:
+          name: Install Maven settings.xml
+          command: |
+            mkdir -p ~/.m2
+            cp settings.xml ~/.m2/settings.xml
+
+      - run:
+          name: Update BOM version
+          command: |
+            BASE_VERSION=$(grep -A1 '<artifactId>cobre-bom</artifactId>' pom.xml \
+              | grep '<version>' \
+              | sed 's/.*<version>\(.*\)<\/version>.*/\1/')
+            if [ "${CIRCLE_BRANCH}" = "trunk" ]; then
+              SUFFIX="-RELEASE"
+            elif [ "<< pipeline.parameters.environment >>" = "prod" ]; then
+              SUFFIX="-PROD"
+            elif [ -n "${CIRCLE_PULL_REQUEST}" ]; then
+              SUFFIX="-RELEASE"
+            else
+              SUFFIX="-SNAPSHOT"
+            fi
+            NEW_VERSION="${BASE_VERSION%%-*}${SUFFIX}"
+            echo "Updating BOM from ${BASE_VERSION} to ${NEW_VERSION}"
+            sed -i "s|<version>${BASE_VERSION}</version>|<version>${NEW_VERSION}</version>|" pom.xml
+
+      - run:
+          name: Build and Test
+          command: mvn -U clean verify -P"<< pipeline.parameters.environment >>" << pipeline.parameters.maven_args >>
+
+      - store_test_results:
+          path: target/surefire-reports
+      - store_artifacts:
+          path: target/surefire-reports
+          destination: test-reports
+      - store_artifacts:
+          path: target/site/jacoco
+          destination: coverage-reports
+
+      - run:
+          name: Process test results
+          when: always
+          command: |
+            if [ -d "target/surefire-reports" ]; then
+              if grep -q "<failure" target/surefire-reports/*.xml \
+                 || grep -q "<error" target/surefire-reports/*.xml; then
+                echo "Tests failed"; exit 1
+              fi
+            fi
+
+      - save_cache:
+          paths:
+            - ~/.m2/repository
+          key: m2-{{ checksum "pom.xml" }}
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+            - target/
+            - pom.xml
+
+  sonar-analysis:
+    docker:
+      - image: << pipeline.parameters.java_image >>
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          keys:
+            - m2-{{ checksum "pom.xml" }}
+            - m2-
+      - run:
+          name: SonarCloud Analysis
+          command: |
+            REPO=$(basename $CIRCLE_REPOSITORY_URL .git)
+            export SONAR_SCANNER_OPTS="-Dsonar.branch.autoconfig.disabled=true -Dsonar.branch.name=${CIRCLE_BRANCH}"
+            mvn sonar:sonar \
+              -Dsonar.projectKey=Cobre-Colombia_${REPO} \
+              -Dsonar.organization=cobre-colombia \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.sources=src/main/java \
+              -Dsonar.tests=src/test/java \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.java.test.binaries=target/test-classes \
+              -Dsonar.java.source=<< pipeline.parameters.java_version >> \
+              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+              -Dsonar.junit.reportPaths=target/surefire-reports
+
+  prepare-image:
+    docker:
+      - image: << pipeline.parameters.java_image >>
+    steps:
+      - run:
+          name: Prepare image
+          command: |
+            echo "Preparing image for deploying to << pipeline.parameters.deploy_env >>"
+      - attach_workspace:
+          at: .
+      - run:
+          name: Create environment setup script
+          command: |
+            REPO_NAME=$(basename $CIRCLE_REPOSITORY_URL .git)
+            if [ "<< pipeline.parameters.environment >>" = "prod" ]; then
+              TELEMETRY_ENABLED="true"
+            else
+              TELEMETRY_ENABLED="<< pipeline.parameters.telemetry_enabled >>"
+            fi
+            
+            echo "export COMPONENT_NAME=$REPO_NAME" >> env_setup.sh
+            echo "export NEW_RELIC_AGENT_ENABLED=$TELEMETRY_ENABLED" >> env_setup.sh
+            echo "export NEW_RELIC_LICENSE_KEY=$NEW_RELIC_LICENSE_KEY" >> env_setup.sh
+            echo "export NEW_RELIC_APP_NAME=$REPO_NAME-<< pipeline.parameters.environment >>" >> env_setup.sh
+            echo "export NEW_RELIC_ENVIRONMENT=<< pipeline.parameters.environment >>" >> env_setup.sh
+            echo "export APP_VERSION=<< pipeline.parameters.version >>" >> env_setup.sh
+            echo "export GIT_COBRE_TOKEN=$GITHUB_COBRE_TOKEN" >> env_setup.sh
+            echo "export CORE_PROPERTIES_BRANCH=<< pipeline.parameters.properties_branch >>" >> env_setup.sh
+            
+            # echo "export NEW_RELIC_LABELS_OWNER=$NEW_RELIC_LABELS_OWNER" >> env_setup.sh
+            # echo "export TENANT_FLYWAY_ENV=$TENANT_FLYWAY_ENV" >> env_setup.sh
+            # echo "export TENANT_FLYWAY=$TENANT_FLYWAY_ENV" >> env_setup.sh
+
+            cat env_setup.sh
+
+            chmod +x env_setup.sh
+      - persist_to_workspace:
+          root: .
+          paths:
+            - env_setup.sh
+
+  deploy:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Checkout GitOps repo
+          command: |
+            git clone "https://${GITHUB_COBRE_TOKEN}@github.com/Cobre-Colombia/gitops.git" gitops
+            cd gitops
+            git checkout trunk
+            
+            REPO=$(basename $CIRCLE_REPOSITORY_URL .git)
+            COMPONENT=${REPO#util-}
+            BUILD_ID=${CIRCLE_BUILD_NUM}
+            FILE="utils/develop/definitions/${COMPONENT}.yaml"
+            
+            # sustituir sólo la línea de tag
+            sed -i "s#^\(\s*tag:\s*\"\)[^\"\$]*\"#\1<< pipeline.parameters.version_tag >>\"#" "$FILE"
+            
+            git config user.name "Cobre"
+            git config user.email "devops@cobre.co"
+
+            # si hay cambios, commitear con el formato deseado
+            if ! git diff --quiet; then
+              git add "$FILE"
+              git commit -m "Update image tag of component ${COMPONENT} on util-<< pipeline.parameters.deploy_env >> of build-id #${BUILD_ID}"
+              git push origin trunk
+            else
+              echo "No changes to commit"
+            fi
+
+workflows:
+  validate-pull-request:
+    when: << pipeline.parameters.is_pr >>
+    jobs:
+      - build-and-test:
+          context:
+            - github-cobre
+            - jfrog-cobre
+            - sonarcloud
+      - sonar-analysis:
+          requires:
+            - build-and-test
+          context:
+            - sonarcloud
+
+  deploy-dev:
+    when:
+      and:
+        - << pipeline.parameters.should_deploy >>
+        - << pipeline.parameters.environment >> == "dev"
+    jobs:
+      - build-and-test:
+          context:
+            - github-cobre
+            - jfrog-cobre
+            - sonarcloud
+      - prepare-image:
+          requires:
+            - build-and-test
+          context:
+            - cobre-dev
+            - github-cobre
+      - aws-ecr/build_and_push_image:
+          requires:
+              - prepare-image
+          auth:
+            - aws-cli/setup:
+                role_arn: "arn:aws:iam::891899566293:role/circleci-role-devqa"
+          account_id: $AWS_ACCOUNT_ID
+          attach_workspace: true
+          workspace_root: .
+          dockerfile: Dockerfile
+          tag: "<< pipeline.parameters.version_tag >>,latest"
+          repo: "dev/utilitarios/util-network-routing"
+          context: cobre-dev
+          platform: linux/arm64
+          extra_build_args: >-
+            --build-arg COMPONENT_NAME=$(basename $CIRCLE_REPOSITORY_URL .git)
+            --build-arg NEWRELIC_API_KEY=$NEW_RELIC_LICENSE_KEY
+            --build-arg ENVIRONMENT=<< pipeline.parameters.environment >>
+      - deploy:
+          requires:
+            - aws-ecr/build_and_push_image
+          context:
+            - github-cobre
