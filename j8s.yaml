@@ -1,4 +1,4 @@
 image:
-  tag: k8s
+  tag: k8s.new
 name:
   value: false
